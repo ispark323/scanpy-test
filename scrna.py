@@ -1,66 +1,73 @@
 import gradio as gr
 import os
 import shutil
-import requests
-import torch
-from timm import create_model
-from timm.data import resolve_data_config
-from timm.data.transforms_factory import create_transform
+import zipfile
+from PIL import Image
+import scanpy as sc
+import numpy as np
 
-
-IMAGENET_1k_URL = "https://storage.googleapis.com/bit_models/ilsvrc2012_wordnet_lemmas.txt"
-LABELS = requests.get(IMAGENET_1k_URL).text.strip().split('\n')
-
-model = create_model('resnet50', pretrained=True)
-
-transform = create_transform(
-    **resolve_data_config({}, model=model)
-)
-model.eval()
-
-
-def upload_file(files):
+def process_fn(fileobj):
+    # Unzip file
+    print("fileobj name:", fileobj.name)
     UPLOAD_FOLDER = './data'
     if not os.path.exists(UPLOAD_FOLDER):
         os.mkdir(UPLOAD_FOLDER)
+    shutil.copy(fileobj, UPLOAD_FOLDER)
+    
+    with zipfile.ZipFile(fileobj, 'r') as zip_ref:
+        zip_ref.extractall('./data')
 
-    file_paths = [file.name for file in files]
-    for file in files:
-        shutil.copy(file, UPLOAD_FOLDER)
+    # Analyze
+    adata = sc.read_10x_mtx(
+        './data', 
+        var_names='gene_symbols', # use gene symbols for the variable names (variables-axis index)
+        cache=True)
+    
+    sc.pp.filter_cells(adata, min_genes=200) # get rid of cells with fewer than 200 genes
+    sc.pp.filter_genes(adata, min_cells=3) # get rid of genes that are found in fewer than 3 cells
 
-    return file_paths
+    adata.var['mt'] = adata.var_names.str.startswith('MT-')  # annotate the group of mitochondrial genes as 'mt'
+    sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
+    # print(adata.obs)
+
+    upper_lim = np.quantile(adata.obs.n_genes_by_counts.values, .98)
+    lower_lim = np.quantile(adata.obs.n_genes_by_counts.values, .02)
+    adata[adata.obs.index == 'AAACCCAAGCCTGTGC-1']
+    adata = adata[(adata.obs.n_genes_by_counts < upper_lim) & (adata.obs.n_genes_by_counts > lower_lim)]
+    adata = adata[adata.obs.pct_counts_mt < 20]
+    sc.pp.normalize_total(adata, target_sum=1e4) #normalize every cell to 10,000 UMI
+    sc.pp.log1p(adata) # change to log counts
+
+    sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5) # these are default values
+    adata.raw = adata # save raw data before processing values and further filtering
+    adata = adata[:, adata.var.highly_variable] # filter highly variable
+    sc.pp.regress_out(adata, ['total_counts', 'pct_counts_mt']) #Regress out effects of total counts per cell and the percentage of mitochondrial genes expressed
+    sc.pp.scale(adata, max_value=10) # scale each gene to unit variance
+    sc.tl.pca(adata, svd_solver='arpack')
+    # sc.pl.pca_variance_ratio(adata, log=True)
+    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=20)
+    sc.tl.umap(adata)
+    sc.tl.leiden(adata, resolution = 0.25)
+    sc.pl.umap(adata, color=['leiden'], save='_1.png')
+    img = Image.open('figures/umap_1.png')
+
+    return img
+
+title = "Single Cell RNA UMAP Generator"
+desc = "Upload a zip file and generate UMAP figure"
+
+with gr.Blocks() as demo:
+    result = gr.Image(label="Result", show_label=False)
+
+    gr.Interface(
+        title=title,
+        description=desc,
+        fn=process_fn,
+        inputs=[
+            "file",
+        ],
+        outputs=[result]
+    )
 
 
-def predict_fn(img):
-    img = img.convert('RGB')
-    img = transform(img).unsqueeze(0)
-
-    with torch.no_grad():
-        out = model(img)
-
-    probabilites = torch.nn.functional.softmax(out[0], dim=0)
-
-    values, indices = torch.topk(probabilites, k=5)
-
-    return {LABELS[i]: v.item() for i, v in zip(indices, values)}
-
-def analyze_fn(input):
-    return input
-
-# gr.Interface(predict_fn, gr.components.Image(type='pil'), outputs='label').launch()
-# gr.Interface(predict_fn, upload_file, outputs='label').launch()
-
-with gr.Blocks() as block:
-    label = gr.Label()
-    file_output = gr.File()
-
-    upload_button = gr.UploadButton("Click to Upload a File", file_count="multiple")
-    file_list = upload_button.upload(upload_file, upload_button, file_output)
-
-    analyze_button = gr.Button("Analyze")
-
-    analyze_button.click(analyze_fn, inputs=file_list, outputs=label)
-
-block.launch()
-
-
+demo.queue().launch()
